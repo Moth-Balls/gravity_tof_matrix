@@ -10,10 +10,13 @@ class LidarNode(Node):
     def __init__(self):
         super().__init__('gravity_tof_matrix_node')
         
-        self.declare_parameter('port', '/dev/ttyACM1')
-        serial_port = self.get_parameter('port').value
+        self.declare_parameter('port', '/dev/ttyUSB0')
+        self.declare_parameter('topic', '/points')
 
-        self.publisher = self.create_publisher(PointCloud2, 'points', 10)
+        serial_port = self.get_parameter('port').value
+        topic_name = self.get_parameter('topic').value
+
+        self.publisher = self.create_publisher(PointCloud2, topic_name, 10)
         
         self.matrix = np.zeros((8, 8), dtype=np.float32)
         
