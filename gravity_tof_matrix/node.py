@@ -1,16 +1,20 @@
+import os
+import sys
+import time
+import numpy as np
+
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import PointCloud2, PointField
-import numpy as np
+
 import serial
-import sys
-import threading
+
 
 class LidarNode(Node):
     def __init__(self):
         super().__init__('gravity_tof_matrix_node')
-        
-        self.declare_parameter('port', '/dev/ttyUSB0')
+
+        self.declare_parameter('port', '/dev/ttyTHS1')
         self.declare_parameter('topic', '/points')
 
         serial_port = self.get_parameter('port').value
@@ -18,55 +22,62 @@ class LidarNode(Node):
 
         self.publisher = self.create_publisher(PointCloud2, topic_name, 10)
         
-        self.matrix = np.zeros((8, 8), dtype=np.float32)
-        
         try:
             self.ser = serial.Serial(serial_port, 115200, timeout=1)
             self.ser.reset_input_buffer()
-            self.get_logger().info(f"Connected directly to Lidar on {serial_port}")
+            self.ser.reset_output_buffer()
+            self.get_logger().info(f"Connected to Lidar on {serial_port}")
         except Exception as e:
             self.get_logger().error(f"Failed to open serial port {serial_port}: {e}")
             sys.exit(1)
 
-        self.running = True
-        self.read_thread = threading.Thread(target=self.serial_listener, daemon=True)
-        self.read_thread.start()
+        set_mode_pkt = bytes([0x55, 0x00, 0x05, 0x01, 0x00, 0x00, 0x00, 0x03])
+        self.get_logger().debug("Sending initialization packet to wake up LiDAR...")
+        self.ser.write(set_mode_pkt)
+        time.sleep(0.3) 
+        
+        if self.ser.in_waiting:
+            self.ser.read(self.ser.in_waiting)
 
-    def serial_listener(self):
-        while self.running and rclpy.ok():
-            try:
-                if self.ser.in_waiting > 0:
-                    line = self.ser.readline().decode('utf-8', errors='ignore').strip()
-                    
-                    if line.startswith('y') and ':' in line:
-                        row_part, data_part = line.split(':')
-                        
-                        row_idx = int(row_part[1])
-                        
-                        distances = [float(x) / 1000.0 for x in data_part.split(',') if x]
-                        
-                        if len(distances) == 8 and 0 <= row_idx < 8:
-                            self.matrix[row_idx] = distances
-                            
-                            if row_idx == 7:
-                                self.publish_scan()
-                                
-            except Exception as e:
-                self.get_logger().warn(f"Error parsing serial data: {e}")
+        self.request_data_pkt = bytes([0x55, 0x00, 0x01, 0x02])
 
-    def publish_scan(self):
-        """Converts the parsed 8x8 matrix into a PointCloud2 and publishes it."""
+        self.create_timer(0.05, self.update_lidar)
+
+    def update_lidar(self):
+        try:
+            self.ser.write(self.request_data_pkt)
+            
+            header = self.ser.read(4)
+            if len(header) != 4:
+                return
+
+            status, echo_cmd, len_l, len_h = header
+            
+            if status == 0x53 and echo_cmd == 0x02:
+                data_len = (len_h << 8) | len_l
+                
+                if data_len == 128:
+                    payload = self.ser.read(128)
+                    if len(payload) == 128:
+                        self.process_and_publish(payload)
+                        
+        except Exception as e:
+            self.get_logger().warn(f"Serial communication error: {e}")
+
+    def process_and_publish(self, payload):
+
+        distances_mm = np.frombuffer(payload, dtype=np.uint16)
+        distances_m = distances_mm.astype(np.float32) / 1000.0
+
         points = np.zeros((64, 3), dtype=np.float32)
         
-        for row in range(8):
-            for col in range(8):
-                idx = row * 8 + col
-                dist = self.matrix[row, col]
-                
-                # Convert grid indexes to x, y, z coordinates
-                points[idx, 0] = col * 0.1
-                points[idx, 1] = row * 0.1
-                points[idx, 2] = dist
+        for i in range(64):
+            row = i // 8
+            col = i % 8
+            
+            points[i, 0] = col * 0.05    # X axis
+            points[i, 1] = row * 0.05    # Y axis
+            points[i, 2] = distances_m[i] # Z axis
 
         msg = PointCloud2()
         msg.header.stamp = self.get_clock().now().to_msg()
@@ -88,7 +99,6 @@ class LidarNode(Node):
         self.publisher.publish(msg)
 
     def destroy_node(self):
-        self.running = False
         if hasattr(self, 'ser') and self.ser.is_open:
             self.ser.close()
         super().destroy_node()
@@ -104,6 +114,7 @@ def main(args=None):
     finally:
         node.destroy_node()
         rclpy.shutdown()
+
 
 if __name__ == "__main__":
     main()
